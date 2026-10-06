@@ -14,13 +14,37 @@ This project is an editable agent workflow canvas.
 - Node `position` is visual only — never invent steps from layout.
 - When the user edits the graph, prefer updating the JSON/spec, not freeform prose plans.
 
+## Language (hard rule)
+
+- **Match the conversation language.** There is no manual language switcher for end users.
+- If the user writes in 中文 or 日本語, draft the engineering diagram in that language — not English.
+- Apply this to: `title`, `description`, every `node.label`, every `node.goal`, and edge `label`s.
+- Keep `kind` in the English enum only: `start | research | think | tool | branch | human | output`.
+- Confirmations and restatements must use the same language as the diagram. Never force an English-only plan “for clarity.”
+- Mixed-language labels are OK when the user mixes languages; still do not rewrite everything into English.
+
 ## When helping the user
 
-1. Draft workflows as structured nodes with clear `kind` and `goal`.
+1. Draft workflows as structured nodes with clear `kind` and `goal` **in the user’s language**.
 2. After user edits, restate the plan from the JSON and flag validation issues (cycles, empty goals, unreachable nodes).
-3. Do not execute a workflow until the user confirms the compiled spec.
-4. Keep confirmations short: restatement → APPROVED or NEEDS_FIX → minimal fixes.
+3. Prefer Confirm (redraw engineering layout) then Order; do not execute silently unless the user asks to Order.
+4. Keep confirmations short: restatement → APPROVED or NEEDS_FIX → minimal fixes — in the diagram’s language.
 
 ## Node kinds
 
 `start` | `research` | `think` | `tool` | `branch` | `human` | `output`
+
+## Example (Chinese conversation → Chinese diagram)
+
+```json
+{
+  "version": 1,
+  "title": "竞品定价简报",
+  "description": "调研竞品并输出人工可审阅的简报",
+  "nodes": [
+    { "id": "start", "kind": "start", "label": "开始", "goal": "接收品类与市场输入" },
+    { "id": "research", "kind": "research", "label": "收集来源", "goal": "抓取前五名竞品公开定价页" }
+  ],
+  "edges": [{ "id": "e1", "from": "start", "to": "research" }]
+}
+```

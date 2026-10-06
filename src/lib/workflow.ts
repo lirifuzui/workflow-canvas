@@ -1,4 +1,5 @@
 import type { Edge, Node } from '@xyflow/react'
+import type { Messages } from '../i18n/messages'
 import type { ValidationIssue, WorkflowNodeData, WorkflowSpec } from '../types/workflow'
 
 export function graphToSpec(
@@ -7,19 +8,29 @@ export function graphToSpec(
   nodes: Node<WorkflowNodeData>[],
   edges: Edge[],
 ): WorkflowSpec {
+  const order = topologicalOrderIds(
+    nodes.map((n) => n.id),
+    edges.map((e) => ({ from: e.source, to: e.target })),
+  )
+  const stepOf = new Map(order.map((id, index) => [id, index + 1]))
+
   return {
     version: 1,
     id: slugify(title) || 'untitled-workflow',
     title,
     description,
-    nodes: nodes.map((node) => ({
-      id: node.id,
-      kind: node.data.kind,
-      label: node.data.label,
-      goal: node.data.goal,
-      notes: node.data.notes || undefined,
-      position: { x: Math.round(node.position.x), y: Math.round(node.position.y) },
-    })),
+    order,
+    nodes: [...nodes]
+      .sort((a, b) => (stepOf.get(a.id) ?? 0) - (stepOf.get(b.id) ?? 0))
+      .map((node) => ({
+        id: node.id,
+        kind: node.data.kind,
+        label: node.data.label,
+        goal: node.data.goal,
+        notes: node.data.notes || undefined,
+        step: stepOf.get(node.id) ?? 0,
+        position: { x: Math.round(node.position.x), y: Math.round(node.position.y) },
+      })),
     edges: edges.map((edge) => ({
       id: edge.id,
       from: edge.source,
@@ -121,16 +132,21 @@ export function validateSpec(spec: WorkflowSpec): ValidationIssue[] {
   return issues
 }
 
-export function specToPrompt(spec: WorkflowSpec, issues: ValidationIssue[]): string {
+export function specToPrompt(
+  spec: WorkflowSpec,
+  issues: ValidationIssue[],
+  m: Messages,
+): string {
   const issueBlock =
     issues.length === 0
-      ? 'Static validation: no issues.'
-      : `Static validation:\n${issues.map((i) => `- [${i.level}] ${i.message}`).join('\n')}`
+      ? m.promptStaticOk
+      : `${m.promptStaticHeader}\n${issues.map((i) => `- [${i.level}] ${i.message}`).join('\n')}`
 
   return [
-    'You are confirming an editable agent workflow before execution.',
+    m.promptIntro,
     'Treat the JSON below as the single source of truth. Do not invent extra steps.',
-    'Reply with: (1) a short plain-language restatement of the plan, (2) APPROVED or NEEDS_FIX, (3) any minimal fixes.',
+    m.promptReplyRules,
+    m.promptLanguage,
     '',
     issueBlock,
     '',
@@ -140,7 +156,10 @@ export function specToPrompt(spec: WorkflowSpec, issues: ValidationIssue[]): str
   ].join('\n')
 }
 
-export function confirmWorkflow(spec: WorkflowSpec): {
+export function confirmWorkflow(
+  spec: WorkflowSpec,
+  m: Messages,
+): {
   status: 'approved' | 'needs_fix'
   summary: string
   issues: ValidationIssue[]
@@ -148,51 +167,66 @@ export function confirmWorkflow(spec: WorkflowSpec): {
 } {
   const issues = validateSpec(spec)
   const errors = issues.filter((i) => i.level === 'error')
+  const warnings = issues.filter((i) => i.level === 'warning')
   const steps = topologicalLabels(spec)
 
   const summary =
     errors.length > 0
-      ? `I cannot approve this workflow yet. Fix ${errors.length} error(s) first, then ask again.`
-      : [
-          `Plan "${spec.title}" is ready.`,
-          `I will run ${spec.nodes.length} steps in this order: ${steps.join(' → ')}.`,
-          spec.description.trim() ? `Intent: ${spec.description.trim()}` : null,
-          issues.length
-            ? `There are ${issues.length} warning(s) you may want to review, but nothing blocking.`
-            : 'No structural issues found.',
-        ]
-          .filter(Boolean)
-          .join(' ')
+      ? m.confirmBlocked(errors.length)
+      : m.confirmReady(
+          spec.title,
+          spec.nodes.length,
+          steps.join(' → '),
+          spec.description.trim(),
+          warnings.length,
+        )
 
   return {
     status: errors.length > 0 ? 'needs_fix' : 'approved',
     summary,
     issues,
-    llmPrompt: specToPrompt(spec, issues),
+    llmPrompt: specToPrompt(spec, issues, m),
   }
 }
 
-function topologicalLabels(spec: WorkflowSpec): string[] {
-  const indegree = new Map(spec.nodes.map((n) => [n.id, 0]))
-  const adj = new Map(spec.nodes.map((n) => [n.id, [] as string[]]))
-  for (const edge of spec.edges) {
+export function topologicalOrderIds(
+  nodeIds: string[],
+  edges: Array<{ from: string; to: string }>,
+): string[] {
+  const indegree = new Map(nodeIds.map((id) => [id, 0]))
+  const adj = new Map(nodeIds.map((id) => [id, [] as string[]]))
+  for (const edge of edges) {
+    if (!indegree.has(edge.from) || !indegree.has(edge.to)) continue
     adj.get(edge.from)?.push(edge.to)
     indegree.set(edge.to, (indegree.get(edge.to) ?? 0) + 1)
   }
 
-  const queue = spec.nodes.filter((n) => (indegree.get(n.id) ?? 0) === 0).map((n) => n.id)
+  const queue = nodeIds.filter((id) => (indegree.get(id) ?? 0) === 0)
   const order: string[] = []
   while (queue.length) {
     const id = queue.shift()!
-    const node = spec.nodes.find((n) => n.id === id)
-    if (node) order.push(node.label)
+    order.push(id)
     for (const next of adj.get(id) ?? []) {
       const nextDeg = (indegree.get(next) ?? 0) - 1
       indegree.set(next, nextDeg)
       if (nextDeg === 0) queue.push(next)
     }
   }
-  return order.length ? order : spec.nodes.map((n) => n.label)
+
+  if (order.length !== nodeIds.length) {
+    for (const id of nodeIds) {
+      if (!order.includes(id)) order.push(id)
+    }
+  }
+  return order
+}
+
+function topologicalLabels(spec: WorkflowSpec): string[] {
+  const order = topologicalOrderIds(
+    spec.nodes.map((n) => n.id),
+    spec.edges.map((e) => ({ from: e.from, to: e.to })),
+  )
+  return order.map((id) => spec.nodes.find((n) => n.id === id)?.label ?? id)
 }
 
 function slugify(value: string): string {

@@ -1,25 +1,41 @@
 import {
   Background,
+  ConnectionMode,
   Controls,
+  MarkerType,
   MiniMap,
   ReactFlow,
   ReactFlowProvider,
   addEdge,
+  reconnectEdge,
   useEdgesState,
   useNodesState,
   useReactFlow,
   type Connection,
+  type Edge,
   type Node,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import { SpecPanel } from './components/SpecPanel'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { WorkflowNode } from './components/WorkflowNode'
-import { SAMPLE_WORKFLOWS } from './lib/samples'
-import { confirmWorkflow, graphToSpec } from './lib/workflow'
-import type { ConfirmResult, NodeKind, WorkflowFlowNode, WorkflowNodeData } from './types/workflow'
+import { useLocale } from './i18n/useLocale'
+import { DOC_MAP_REDUCE_PLANS } from './lib/docMapReducePlan'
+import { detectLocaleFromText } from './lib/language'
+import { refineEngineeringDiagram } from './lib/refineDiagram'
+import { INITIAL_WORKFLOWS } from './lib/samples'
+import { confirmWorkflow, graphToSpec, topologicalOrderIds } from './lib/workflow'
+import type { ConfirmResult, NodeKind, RunStatus, WorkflowFlowNode, WorkflowNodeData } from './types/workflow'
+import type { Locale } from './i18n/locale'
 
 const nodeTypes = { workflow: WorkflowNode }
+
+function resolveInitialWorkflow(locale: Locale) {
+  const plan = new URLSearchParams(window.location.search).get('plan')
+  if (plan === 'map-reduce' || plan === 'uxopian' || plan === 'uvp') {
+    return DOC_MAP_REDUCE_PLANS[locale]
+  }
+  return INITIAL_WORKFLOWS[locale]
+}
 
 const KIND_OPTIONS: NodeKind[] = [
   'start',
@@ -31,20 +47,106 @@ const KIND_OPTIONS: NodeKind[] = [
   'output',
 ]
 
+const defaultEdgeOptions: Partial<Edge> = {
+  type: 'smoothstep',
+  animated: true,
+  reconnectable: true,
+  markerEnd: {
+    type: MarkerType.ArrowClosed,
+    width: 18,
+    height: 18,
+    color: '#1f6f5b',
+  },
+  style: { stroke: '#1f6f5b', strokeWidth: 2.25 },
+}
+
+function withEdgeDefaults(edges: Edge[]): Edge[] {
+  return edges.map((edge) => ({
+    ...defaultEdgeOptions,
+    ...edge,
+    markerEnd: edge.markerEnd ?? defaultEdgeOptions.markerEnd,
+    style: { ...defaultEdgeOptions.style, ...edge.style },
+  }))
+}
+
 function CanvasApp() {
-  const initial = SAMPLE_WORKFLOWS[0]
+  const { locale, setLocale, m } = useLocale()
+  const initial = useMemo(() => resolveInitialWorkflow(locale), [])
   const [title, setTitle] = useState(initial.title)
   const [description, setDescription] = useState(initial.description)
   const [nodes, setNodes, onNodesChange] = useNodesState<WorkflowFlowNode>(initial.nodes)
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initial.edges)
-  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [edges, setEdges, onEdgesChange] = useEdgesState(withEdgeDefaults(initial.edges))
+  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
+  const [selectedEdgeId, setSelectedEdgeId] = useState<string | null>(null)
   const [confirm, setConfirm] = useState<ConfirmResult | null>(null)
+  const [refineNote, setRefineNote] = useState<string | null>(null)
+  const [revision, setRevision] = useState(0)
+  const [ordering, setOrdering] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
+  const sourceNote =
+    'sourceNote' in initial && typeof initial.sourceNote === 'string' ? initial.sourceNote : null
   const { fitView, screenToFlowPosition } = useReactFlow()
+  const orderTimerRef = useRef<number | null>(null)
 
-  const selected = useMemo(
-    () => nodes.find((node) => node.id === selectedId) ?? null,
-    [nodes, selectedId],
+  useEffect(() => {
+    return () => {
+      if (orderTimerRef.current) window.clearTimeout(orderTimerRef.current)
+    }
+  }, [])
+
+  // UI language follows diagram/conversation text — no manual switcher.
+  useEffect(() => {
+    const guessed = detectLocaleFromText(
+      title,
+      description,
+      ...nodes.map((node) => `${node.data.label}\n${node.data.goal}`),
+    )
+    if (guessed && guessed !== locale) {
+      setLocale(guessed)
+    }
+  }, [title, description, nodes, locale, setLocale])
+
+  const selectedNode = useMemo(
+    () => nodes.find((node) => node.id === selectedNodeId) ?? null,
+    [nodes, selectedNodeId],
+  )
+  const selectedEdge = useMemo(
+    () => edges.find((edge) => edge.id === selectedEdgeId) ?? null,
+    [edges, selectedEdgeId],
+  )
+
+  const orderIds = useMemo(
+    () =>
+      topologicalOrderIds(
+        nodes.map((n) => n.id),
+        edges.map((e) => ({ from: e.source, to: e.target })),
+      ),
+    [nodes, edges],
+  )
+
+  const stepMap = useMemo(() => {
+    const map = new Map<string, number>()
+    orderIds.forEach((id, index) => map.set(id, index + 1))
+    return map
+  }, [orderIds])
+
+  const displayNodes = useMemo(
+    () =>
+      nodes.map((node) => ({
+        ...node,
+        data: { ...node.data, step: stepMap.get(node.id) },
+      })),
+    [nodes, stepMap],
+  )
+
+  const orderLabels = useMemo(
+    () =>
+      orderIds.map((id) => {
+        const node = nodes.find((n) => n.id === id)
+        const step = stepMap.get(id)
+        return { id, step, label: node?.data.label ?? id }
+      }),
+    [orderIds, nodes, stepMap],
   )
 
   const spec = useMemo(
@@ -53,37 +155,82 @@ function CanvasApp() {
   )
 
   useEffect(() => {
-    const timer = window.setTimeout(() => fitView({ padding: 0.18, duration: 400 }), 40)
+    const timer = window.setTimeout(() => fitView({ padding: 0.28, duration: 400 }), 40)
     return () => window.clearTimeout(timer)
   }, [fitView])
 
+  const bump = () => {
+    setConfirm(null)
+    setRefineNote(null)
+  }
+
+  const setRunStatuses = (statuses: Map<string, RunStatus> | 'clear') => {
+    setNodes((current) =>
+      current.map((node) => ({
+        ...node,
+        data: {
+          ...node.data,
+          runStatus: statuses === 'clear' ? 'idle' : (statuses.get(node.id) ?? 'idle'),
+        },
+      })),
+    )
+  }
+
+  const stopOrdering = () => {
+    if (orderTimerRef.current) {
+      window.clearTimeout(orderTimerRef.current)
+      orderTimerRef.current = null
+    }
+    setOrdering(false)
+  }
+
   const onConnect = useCallback(
     (connection: Connection) => {
-      setEdges((eds) => addEdge({ ...connection, animated: true }, eds))
-      setConfirm(null)
+      setEdges((eds) =>
+        addEdge(
+          {
+            ...connection,
+            ...defaultEdgeOptions,
+            id: `e_${connection.source}_${connection.target}_${Date.now().toString(36)}`,
+          },
+          eds,
+        ),
+      )
+      bump()
     },
     [setEdges],
   )
 
-  const loadSample = (index: number) => {
-    const sample = SAMPLE_WORKFLOWS[index]
-    setTitle(sample.title)
-    setDescription(sample.description)
-    setNodes(sample.nodes)
-    setEdges(sample.edges)
-    setSelectedId(null)
-    setConfirm(null)
-    window.setTimeout(() => fitView({ padding: 0.18, duration: 500 }), 30)
-  }
+  const onReconnect = useCallback(
+    (oldEdge: Edge, newConnection: Connection) => {
+      setEdges((eds) => reconnectEdge(oldEdge, newConnection, eds))
+      bump()
+    },
+    [setEdges],
+  )
+
+  const isValidConnection = useCallback((connection: Connection | Edge) => {
+    const source = 'source' in connection ? connection.source : null
+    const target = 'target' in connection ? connection.target : null
+    return Boolean(source && target && source !== target)
+  }, [])
 
   const updateSelected = (patch: Partial<WorkflowNodeData>) => {
-    if (!selectedId) return
+    if (!selectedNodeId) return
     setNodes((current) =>
       current.map((node) =>
-        node.id === selectedId ? { ...node, data: { ...node.data, ...patch } } : node,
+        node.id === selectedNodeId ? { ...node, data: { ...node.data, ...patch } } : node,
       ),
     )
-    setConfirm(null)
+    bump()
+  }
+
+  const updateSelectedEdge = (patch: Partial<Pick<Edge, 'source' | 'target' | 'label'>>) => {
+    if (!selectedEdgeId) return
+    setEdges((current) =>
+      current.map((edge) => (edge.id === selectedEdgeId ? { ...edge, ...patch } : edge)),
+    )
+    bump()
   }
 
   const addNode = (kind: NodeKind = 'think') => {
@@ -98,36 +245,107 @@ function CanvasApp() {
       position,
       data: {
         kind,
-        label: kind === 'human' ? 'Human gate' : kind[0].toUpperCase() + kind.slice(1),
-        goal: 'Describe what this step should accomplish.',
+        label: kind === 'human' ? m.humanGateLabel : m.kinds[kind],
+        goal: m.defaultNodeGoal,
       },
     }
     setNodes((current) => [...current, node])
-    setSelectedId(id)
-    setConfirm(null)
+    setSelectedNodeId(id)
+    setSelectedEdgeId(null)
+    bump()
   }
 
-  const deleteSelected = () => {
-    if (!selectedId) return
-    setNodes((current) => current.filter((node) => node.id !== selectedId))
+  const deleteSelectedNode = () => {
+    if (!selectedNodeId) return
+    setNodes((current) => current.filter((node) => node.id !== selectedNodeId))
     setEdges((current) =>
-      current.filter((edge) => edge.source !== selectedId && edge.target !== selectedId),
+      current.filter((edge) => edge.source !== selectedNodeId && edge.target !== selectedNodeId),
     )
-    setSelectedId(null)
-    setConfirm(null)
+    setSelectedNodeId(null)
+    bump()
+  }
+
+  const deleteSelectedEdge = () => {
+    if (!selectedEdgeId) return
+    setEdges((current) => current.filter((edge) => edge.id !== selectedEdgeId))
+    setSelectedEdgeId(null)
+    bump()
   }
 
   const handleConfirm = () => {
-    setConfirm(confirmWorkflow(spec))
+    stopOrdering()
+    setRunStatuses('clear')
+    const checked = confirmWorkflow(spec, m)
+    const issues = checked.issues.filter((i) => i.level === 'error')
+    if (issues.length > 0) {
+      setRefineNote(null)
+      setConfirm(checked)
+      setToast(m.toastFixBeforeConfirm)
+      window.setTimeout(() => setToast(null), 2000)
+      return
+    }
+
+    const refined = refineEngineeringDiagram(nodes, edges, revision, m)
+    setRevision(refined.revision)
+    setNodes(refined.nodes as WorkflowFlowNode[])
+    setEdges(withEdgeDefaults(refined.edges))
+    setConfirm(null)
+    setRefineNote(refined.summary)
+    setSelectedNodeId(null)
+    setSelectedEdgeId(null)
+    window.setTimeout(() => fitView({ padding: 0.28, duration: 500 }), 40)
+  }
+
+  const handleOrder = () => {
+    stopOrdering()
+    setConfirm(null)
+    setRefineNote(null)
+
+    const checked = confirmWorkflow(spec, m)
+    const issues = checked.issues.filter((i) => i.level === 'error')
+    if (issues.length > 0) {
+      setConfirm(checked)
+      setToast(m.toastFixBeforeOrder)
+      window.setTimeout(() => setToast(null), 2000)
+      return
+    }
+
+    const sequence = [...orderIds]
+    const statusMap = new Map<string, RunStatus>(sequence.map((id) => [id, 'pending']))
+    setRunStatuses(statusMap)
+    setOrdering(true)
+
+    let index = 0
+    const tick = () => {
+      if (index > 0) {
+        statusMap.set(sequence[index - 1], 'done')
+      }
+      if (index >= sequence.length) {
+        setRunStatuses(new Map(statusMap))
+        setOrdering(false)
+        orderTimerRef.current = null
+        setToast(m.toastOrderComplete)
+        window.setTimeout(() => setToast(null), 1800)
+        return
+      }
+      statusMap.set(sequence[index], 'running')
+      setRunStatuses(new Map(statusMap))
+      setSelectedNodeId(sequence[index])
+      setSelectedEdgeId(null)
+      index += 1
+      orderTimerRef.current = window.setTimeout(tick, 900)
+    }
+    tick()
   }
 
   const copyPrompt = async () => {
-    const result = confirm ?? confirmWorkflow(spec)
-    setConfirm(result)
+    const result = confirmWorkflow(spec, m)
     await navigator.clipboard.writeText(result.llmPrompt)
-    setToast('Confirmation prompt copied')
+    setToast(m.toastCopied)
     window.setTimeout(() => setToast(null), 1800)
   }
+
+  const editing = Boolean(selectedNode || selectedEdge)
 
   return (
     <div className="app-shell">
@@ -136,25 +354,28 @@ function CanvasApp() {
           <div className="brand-mark" aria-hidden />
           <div>
             <p className="brand-name">Workflow Canvas</p>
-            <p className="brand-tag">LLM drafts the graph. You edit it. Spec goes back for confirm.</p>
+            <p className="brand-tag">
+              {m.brandTag}
+              {revision > 0 ? m.brandTagRevision(revision) : ''}
+            </p>
           </div>
         </div>
         <div className="top-actions">
-          <button type="button" className="btn btn-ghost" onClick={() => loadSample(0)}>
-            Draft A
-          </button>
-          <button type="button" className="btn btn-ghost" onClick={() => loadSample(1)}>
-            Draft B
-          </button>
           <button type="button" className="btn btn-secondary" onClick={() => addNode('think')}>
-            Add node
+            {m.addNode}
+          </button>
+          <button type="button" className="btn btn-ghost" onClick={copyPrompt}>
+            {m.copyPrompt}
+          </button>
+          <button type="button" className="btn btn-primary" onClick={handleConfirm} disabled={ordering}>
+            {m.confirm}
           </button>
           <button
             type="button"
-            className="btn btn-primary"
-            onClick={handleConfirm}
+            className="btn btn-order"
+            onClick={ordering ? stopOrdering : handleOrder}
           >
-            Confirm
+            {ordering ? m.stop : m.order}
           </button>
         </div>
       </header>
@@ -167,96 +388,230 @@ function CanvasApp() {
               value={title}
               onChange={(event) => {
                 setTitle(event.target.value)
-                setConfirm(null)
+                bump()
               }}
-              aria-label="Workflow title"
+              aria-label={m.workflowTitle}
             />
             <input
               className="desc-input"
               value={description}
               onChange={(event) => {
                 setDescription(event.target.value)
-                setConfirm(null)
+                bump()
               }}
-              aria-label="Workflow description"
+              aria-label={m.workflowDescription}
             />
+            {sourceNote ? <p className="source-note">{sourceNote}</p> : null}
+            <div className="order-bar" aria-label={m.orderStrip}>
+              <span className="order-kicker">{m.orderStrip}</span>
+              <div className="order-steps">
+                {orderLabels.map((item, index) => (
+                  <span key={item.id} className="order-chip">
+                    {index > 0 ? (
+                      <span className="order-arrow" aria-hidden>
+                        →
+                      </span>
+                    ) : null}
+                    <button
+                      type="button"
+                      className={`order-pill ${selectedNodeId === item.id ? 'is-active' : ''}`}
+                      onClick={() => {
+                        setSelectedNodeId(item.id)
+                        setSelectedEdgeId(null)
+                      }}
+                    >
+                      <strong>{item.step}</strong> {item.label}
+                    </button>
+                  </span>
+                ))}
+              </div>
+            </div>
           </div>
 
           <div className="canvas-stage">
             <ReactFlow
-              nodes={nodes}
+              nodes={displayNodes}
               edges={edges}
               onNodesChange={(changes) => {
                 onNodesChange(changes)
-                setConfirm(null)
+                bump()
               }}
               onEdgesChange={(changes) => {
                 onEdgesChange(changes)
-                setConfirm(null)
+                bump()
               }}
               onConnect={onConnect}
+              onReconnect={onReconnect}
+              isValidConnection={isValidConnection}
+              edgesReconnectable
+              reconnectRadius={28}
+              connectionMode={ConnectionMode.Loose}
+              connectionRadius={36}
+              defaultEdgeOptions={defaultEdgeOptions}
               nodeTypes={nodeTypes}
-              onNodeClick={(_, node) => setSelectedId(node.id)}
-              onPaneClick={() => setSelectedId(null)}
+              onNodeClick={(_, node) => {
+                setSelectedNodeId(node.id)
+                setSelectedEdgeId(null)
+              }}
+              onEdgeClick={(_, edge) => {
+                setSelectedEdgeId(edge.id)
+                setSelectedNodeId(null)
+              }}
+              onPaneClick={() => {
+                setSelectedNodeId(null)
+                setSelectedEdgeId(null)
+              }}
+              deleteKeyCode={['Backspace', 'Delete']}
               fitView
             >
               <Background gap={22} size={1} color="rgba(28, 39, 51, 0.08)" />
               <Controls showInteractive={false} />
               <MiniMap pannable zoomable />
             </ReactFlow>
-          </div>
 
-          <div className={`inspector ${selected ? 'is-open' : ''}`}>
-            {selected ? (
-              <>
-                <div className="inspector-head">
-                  <span>Edit node</span>
-                  <button type="button" className="btn btn-danger" onClick={deleteSelected}>
-                    Delete
+            {refineNote && (
+              <div className="confirm-banner status-approved">
+                <div className="confirm-banner-head">
+                  <span className="confirm-status">{m.newDiagram}</span>
+                  <button
+                    type="button"
+                    className="btn btn-ghost confirm-dismiss"
+                    onClick={() => setRefineNote(null)}
+                  >
+                    {m.dismiss}
                   </button>
                 </div>
-                <label>
-                  Kind
-                  <select
-                    value={selected.data.kind}
-                    onChange={(event) => updateSelected({ kind: event.target.value as NodeKind })}
+                <p>{refineNote}</p>
+              </div>
+            )}
+
+            {confirm && (
+              <div className={`confirm-banner status-${confirm.status}`}>
+                <div className="confirm-banner-head">
+                  <span className="confirm-status">
+                    {confirm.status === 'approved' ? m.approved : m.needsFix}
+                  </span>
+                  <button
+                    type="button"
+                    className="btn btn-ghost confirm-dismiss"
+                    onClick={() => setConfirm(null)}
                   >
-                    {KIND_OPTIONS.map((kind) => (
-                      <option key={kind} value={kind}>
-                        {kind}
-                      </option>
+                    {m.dismiss}
+                  </button>
+                </div>
+                <p>{confirm.summary}</p>
+                {confirm.issues.length > 0 && (
+                  <ul className="issue-list">
+                    {confirm.issues.map((issue, index) => (
+                      <li key={`${issue.message}-${index}`} className={`issue-${issue.level}`}>
+                        {issue.message}
+                      </li>
                     ))}
-                  </select>
-                </label>
-                <label>
-                  Label
-                  <input
-                    value={selected.data.label}
-                    onChange={(event) => updateSelected({ label: event.target.value })}
-                  />
-                </label>
-                <label>
-                  Goal
-                  <textarea
-                    rows={4}
-                    value={selected.data.goal}
-                    onChange={(event) => updateSelected({ goal: event.target.value })}
-                  />
-                </label>
-                <p className="inspector-hint">Drag handles to reconnect. Layout is visual only — semantics live in JSON.</p>
-              </>
-            ) : (
-              <p className="inspector-empty">Select a node to edit its goal, or drag between handles to rewire the plan.</p>
+                  </ul>
+                )}
+              </div>
             )}
           </div>
-        </section>
 
-        <SpecPanel
-          spec={spec}
-          confirm={confirm}
-          onConfirm={handleConfirm}
-          onCopyPrompt={copyPrompt}
-        />
+          {editing && (
+            <div className="inspector is-open">
+              {selectedNode ? (
+                <>
+                  <div className="inspector-head">
+                    <span>
+                      {m.editNode}
+                      {stepMap.has(selectedNode.id) ? ` · ${stepMap.get(selectedNode.id)}` : ''}
+                    </span>
+                    <button type="button" className="btn btn-danger" onClick={deleteSelectedNode}>
+                      {m.delete}
+                    </button>
+                  </div>
+                  <label>
+                    {m.kind}
+                    <select
+                      value={selectedNode.data.kind}
+                      onChange={(event) => updateSelected({ kind: event.target.value as NodeKind })}
+                    >
+                      {KIND_OPTIONS.map((kind) => (
+                        <option key={kind} value={kind}>
+                          {m.kinds[kind]}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    {m.label}
+                    <input
+                      value={selectedNode.data.label}
+                      onChange={(event) => updateSelected({ label: event.target.value })}
+                    />
+                  </label>
+                  <label>
+                    {m.goal}
+                    <textarea
+                      rows={3}
+                      value={selectedNode.data.goal}
+                      onChange={(event) => updateSelected({ goal: event.target.value })}
+                    />
+                  </label>
+                </>
+              ) : selectedEdge ? (
+                <>
+                  <div className="inspector-head">
+                    <span>{m.editConnection}</span>
+                    <button type="button" className="btn btn-danger" onClick={deleteSelectedEdge}>
+                      {m.delete}
+                    </button>
+                  </div>
+                  <label>
+                    {m.from}
+                    <select
+                      value={selectedEdge.source}
+                      onChange={(event) => updateSelectedEdge({ source: event.target.value })}
+                    >
+                      {nodes.map((node) => (
+                        <option
+                          key={node.id}
+                          value={node.id}
+                          disabled={node.id === selectedEdge.target}
+                        >
+                          {(stepMap.get(node.id) ?? '?') + '. ' + node.data.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    {m.to}
+                    <select
+                      value={selectedEdge.target}
+                      onChange={(event) => updateSelectedEdge({ target: event.target.value })}
+                    >
+                      {nodes.map((node) => (
+                        <option
+                          key={node.id}
+                          value={node.id}
+                          disabled={node.id === selectedEdge.source}
+                        >
+                          {(stepMap.get(node.id) ?? '?') + '. ' + node.data.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    {m.edgeLabel}
+                    <input
+                      value={typeof selectedEdge.label === 'string' ? selectedEdge.label : ''}
+                      placeholder={m.edgeLabelPlaceholder}
+                      onChange={(event) =>
+                        updateSelectedEdge({ label: event.target.value || undefined })
+                      }
+                    />
+                  </label>
+                </>
+              ) : null}
+            </div>
+          )}
+        </section>
       </div>
 
       {toast && <div className="toast">{toast}</div>}
