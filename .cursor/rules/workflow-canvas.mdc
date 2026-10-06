@@ -1,0 +1,26 @@
+---
+description: How to work with Workflow Canvas specs and editable agent plans
+globs:
+alwaysApply: true
+---
+
+# Workflow Canvas
+
+This project is an editable agent workflow canvas.
+
+## Source of truth
+
+- The compiled workflow JSON (`version`, `nodes`, `edges`) is the IR.
+- Node `position` is visual only — never invent steps from layout.
+- When the user edits the graph, prefer updating the JSON/spec, not freeform prose plans.
+
+## When helping the user
+
+1. Draft workflows as structured nodes with clear `kind` and `goal`.
+2. After user edits, restate the plan from the JSON and flag validation issues (cycles, empty goals, unreachable nodes).
+3. Do not execute a workflow until the user confirms the compiled spec.
+4. Keep confirmations short: restatement → APPROVED or NEEDS_FIX → minimal fixes.
+
+## Node kinds
+
+`start` | `research` | `think` | `tool` | `branch` | `human` | `output`
