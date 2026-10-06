@@ -199,7 +199,6 @@ function CanvasApp() {
               onNodeClick={(_, node) => setSelectedId(node.id)}
               onPaneClick={() => setSelectedId(null)}
               fitView
-              proOptions={{ hideAttribution: true }}
             >
               <Background gap={22} size={1} color="rgba(28, 39, 51, 0.08)" />
               <Controls showInteractive={false} />
